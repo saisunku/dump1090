@@ -93,6 +93,60 @@ __attribute__ ((format (printf,3,4))) static char *safe_snprintf(char *p, char *
 static const char *jsonEscapeString(const char *str);
 
 //
+// SBS message structure - contains all fields for BaseStation format output
+//
+typedef enum {
+    SBS_MSG,
+    SBS_STA,
+    SBS_ID,
+    SBS_AIR,
+    SBS_SEL,
+    SBS_CLK
+} sbs_message_type_t;
+
+struct sbs_message {
+    // Fields 1-10: Message metadata
+    sbs_message_type_t message_type;  // Field 1: Message type
+    int transmission_type;            // Field 2: Transmission Type (1-8 for MSG)
+    int session_id;                   // Field 3: Session ID
+    int aircraft_id;                  // Field 4: Aircraft ID
+    unsigned int hex_ident;           // Field 5: Aircraft Mode S hexadecimal code
+    int flight_id;                    // Field 6: Flight ID
+    char date_generated[11];          // Field 7: Date message generated (YYYY/MM/DD)
+    char time_generated[13];          // Field 8: Time message generated (HH:MM:SS.mmm)
+    char date_logged[11];             // Field 9: Date message logged (YYYY/MM/DD)
+    char time_logged[13];             // Field 10: Time message logged (HH:MM:SS.mmm)
+
+    // Fields 11-22: Aircraft information
+    char callsign[9];                 // Field 11: Callsign (8 chars + null terminator)
+    int altitude;                     // Field 12: Altitude (feet)
+    double ground_speed;              // Field 13: Ground speed (knots)
+    double track;                     // Field 14: Track (degrees)
+    double latitude;                  // Field 15: Latitude (decimal degrees)
+    double longitude;                 // Field 16: Longitude (decimal degrees)
+    int vertical_rate;                // Field 17: Vertical rate (feet/min)
+    unsigned int squawk;              // Field 18: Squawk code
+    int alert;                        // Field 19: Alert flag (-1, 0, or invalid)
+    int emergency;                    // Field 20: Emergency flag (-1, 0, or invalid)
+    int spi;                          // Field 21: SPI/Ident flag (-1, 0, or invalid)
+    int is_on_ground;                 // Field 22: On ground flag (-1, 0, or invalid)
+
+    // Validity flags for optional fields
+    bool altitude_valid;
+    bool altitude_is_gnss;            // Flag to append 'H' to altitude
+    bool ground_speed_valid;
+    bool track_valid;
+    bool position_valid;
+    bool vertical_rate_valid;
+    bool vertical_rate_is_gnss;       // Flag to append 'H' to vertical rate
+    bool squawk_valid;
+    bool alert_valid;
+    bool emergency_valid;
+    bool spi_valid;
+    bool airground_valid;
+};
+
+//
 //=========================================================================
 //
 // Networking "stack" initialization
@@ -505,6 +559,340 @@ static void send_beast_heartbeat(struct net_service *service)
 //
 //=========================================================================
 //
+// Helper function to populate SBS message structure from modesMessage and aircraft data
+//
+static void populateSBSMessage(struct sbs_message *sbs, struct modesMessage *mm, struct aircraft *a) {
+    struct timespec now;
+    struct tm stTime_receive, stTime_now;
+    int msgType;
+
+    // Initialize all fields to zero/invalid
+    memset(sbs, 0, sizeof(*sbs));
+
+    // Set message type to MSG (most common for aircraft data)
+    sbs->message_type = SBS_MSG;
+
+    // Determine transmission type based on message type
+    switch (mm->msgtype) {
+    case 4:
+    case 20:
+        msgType = 5;
+        break;
+
+    case 5:
+    case 21:
+        msgType = 6;
+        break;
+
+    case 0:
+    case 16:
+        msgType = 7;
+        break;
+
+    case 11:
+        msgType = 8;
+        break;
+
+    case 17:
+    case 18:
+        if (mm->metype >= 1 && mm->metype <= 4) {
+            msgType = 1;
+        } else if (mm->metype >= 5 && mm->metype <= 8) {
+            msgType = 2;
+        } else if (mm->metype >= 9 && mm->metype <= 18) {
+            msgType = 3;
+        } else if (mm->metype == 19) {
+            msgType = 4;
+        } else {
+            msgType = 0; // Invalid
+        }
+        break;
+
+    default:
+        msgType = 0; // Invalid
+        break;
+    }
+
+    sbs->transmission_type = msgType;
+    sbs->session_id = 1;
+    sbs->aircraft_id = 1;
+    sbs->hex_ident = mm->addr;
+    sbs->flight_id = 1;
+
+    // Find current system time
+    clock_gettime(CLOCK_REALTIME, &now);
+    localtime_r(&now.tv_sec, &stTime_now);
+
+    // Find message reception time
+    time_t received = (time_t)(mm->sysTimestampMsg / 1000);
+    localtime_r(&received, &stTime_receive);
+
+    // Format date and time fields
+    sprintf(sbs->date_generated, "%04d/%02d/%02d",
+            stTime_receive.tm_year + 1900,
+            stTime_receive.tm_mon + 1,
+            stTime_receive.tm_mday);
+    sprintf(sbs->time_generated, "%02d:%02d:%02d.%03u",
+            stTime_receive.tm_hour,
+            stTime_receive.tm_min,
+            stTime_receive.tm_sec,
+            (unsigned)(mm->sysTimestampMsg % 1000));
+    sprintf(sbs->date_logged, "%04d/%02d/%02d",
+            stTime_now.tm_year + 1900,
+            stTime_now.tm_mon + 1,
+            stTime_now.tm_mday);
+    sprintf(sbs->time_logged, "%02d:%02d:%02d.%03u",
+            stTime_now.tm_hour,
+            stTime_now.tm_min,
+            stTime_now.tm_sec,
+            (unsigned)(now.tv_nsec / 1000000U));
+
+    // Populate callsign
+    if (mm->callsign_valid) {
+        strncpy(sbs->callsign, mm->callsign, sizeof(sbs->callsign) - 1);
+        sbs->callsign[sizeof(sbs->callsign) - 1] = '\0';
+    } else {
+        sbs->callsign[0] = '\0';
+    }
+
+    // Populate altitude
+    if (Modes.use_gnss) {
+        if (mm->altitude_geom_valid) {
+            sbs->altitude = mm->altitude_geom;
+            sbs->altitude_valid = true;
+            sbs->altitude_is_gnss = true;
+        } else if (mm->altitude_baro_valid && trackDataValid(&a->geom_delta_valid)) {
+            sbs->altitude = mm->altitude_baro + a->geom_delta;
+            sbs->altitude_valid = true;
+            sbs->altitude_is_gnss = true;
+        } else if (mm->altitude_baro_valid) {
+            sbs->altitude = mm->altitude_baro;
+            sbs->altitude_valid = true;
+            sbs->altitude_is_gnss = false;
+        }
+    } else {
+        if (mm->altitude_baro_valid) {
+            sbs->altitude = mm->altitude_baro;
+            sbs->altitude_valid = true;
+            sbs->altitude_is_gnss = false;
+        } else if (mm->altitude_geom_valid && trackDataValid(&a->geom_delta_valid)) {
+            sbs->altitude = mm->altitude_geom - a->geom_delta;
+            sbs->altitude_valid = true;
+            sbs->altitude_is_gnss = false;
+        }
+    }
+
+    // Populate ground speed
+    if (mm->gs_valid) {
+        sbs->ground_speed = mm->gs.selected;
+        sbs->ground_speed_valid = true;
+    }
+
+    // Populate track
+    if (mm->heading_valid && mm->heading_type == HEADING_GROUND_TRACK) {
+        sbs->track = mm->heading;
+        sbs->track_valid = true;
+    }
+
+    // Populate position
+    if (mm->cpr_decoded) {
+        sbs->latitude = mm->decoded_lat;
+        sbs->longitude = mm->decoded_lon;
+        sbs->position_valid = true;
+    }
+
+    // Populate vertical rate
+    if (Modes.use_gnss) {
+        if (mm->geom_rate_valid) {
+            sbs->vertical_rate = mm->geom_rate;
+            sbs->vertical_rate_valid = true;
+            sbs->vertical_rate_is_gnss = true;
+        } else if (mm->baro_rate_valid) {
+            sbs->vertical_rate = mm->baro_rate;
+            sbs->vertical_rate_valid = true;
+            sbs->vertical_rate_is_gnss = false;
+        }
+    } else {
+        if (mm->baro_rate_valid) {
+            sbs->vertical_rate = mm->baro_rate;
+            sbs->vertical_rate_valid = true;
+            sbs->vertical_rate_is_gnss = false;
+        } else if (mm->geom_rate_valid) {
+            sbs->vertical_rate = mm->geom_rate;
+            sbs->vertical_rate_valid = true;
+            sbs->vertical_rate_is_gnss = false;
+        }
+    }
+
+    // Populate squawk
+    if (mm->squawk_valid) {
+        sbs->squawk = mm->squawk;
+        sbs->squawk_valid = true;
+    }
+
+    // Populate alert flag
+    if (mm->alert_valid) {
+        sbs->alert = mm->alert ? -1 : 0;
+        sbs->alert_valid = true;
+    }
+
+    // Populate emergency flag
+    if (mm->squawk_valid) {
+        if ((mm->squawk == 0x7500) || (mm->squawk == 0x7600) || (mm->squawk == 0x7700)) {
+            sbs->emergency = -1;
+        } else {
+            sbs->emergency = 0;
+        }
+        sbs->emergency_valid = true;
+    }
+
+    // Populate SPI flag
+    if (mm->spi_valid) {
+        sbs->spi = mm->spi ? -1 : 0;
+        sbs->spi_valid = true;
+    }
+
+    // Populate on-ground flag
+    switch (mm->airground) {
+    case AG_GROUND:
+        sbs->is_on_ground = -1;
+        sbs->airground_valid = true;
+        break;
+    case AG_AIRBORNE:
+        sbs->is_on_ground = 0;
+        sbs->airground_valid = true;
+        break;
+    default:
+        sbs->airground_valid = false;
+        break;
+    }
+}
+
+//
+// Helper function to format SBS message structure into a string
+//
+static char *formatSBSMessage(char *p, const struct sbs_message *sbs) {
+    const char *msg_type_str;
+
+    // Convert message type enum to string
+    switch (sbs->message_type) {
+    case SBS_MSG: msg_type_str = "MSG"; break;
+    case SBS_STA: msg_type_str = "STA"; break;
+    case SBS_ID:  msg_type_str = "ID";  break;
+    case SBS_AIR: msg_type_str = "AIR"; break;
+    case SBS_SEL: msg_type_str = "SEL"; break;
+    case SBS_CLK: msg_type_str = "CLK"; break;
+    default:      msg_type_str = "MSG"; break;
+    }
+
+    // Fields 1 to 6
+    p += sprintf(p, "%s,%d,%d,%d,%06X,%d,",
+                 msg_type_str,
+                 sbs->transmission_type,
+                 sbs->session_id,
+                 sbs->aircraft_id,
+                 sbs->hex_ident,
+                 sbs->flight_id);
+
+    // Fields 7 & 8: message reception time and date
+    p += sprintf(p, "%s,%s,", sbs->date_generated, sbs->time_generated);
+
+    // Fields 9 & 10: current time and date
+    p += sprintf(p, "%s,%s", sbs->date_logged, sbs->time_logged);
+
+    // Field 11: callsign
+    if (sbs->callsign[0] != '\0') {
+        p += sprintf(p, ",%s", sbs->callsign);
+    } else {
+        p += sprintf(p, ",");
+    }
+
+    // Field 12: altitude
+    if (sbs->altitude_valid) {
+        if (sbs->altitude_is_gnss) {
+            p += sprintf(p, ",%dH", sbs->altitude);
+        } else {
+            p += sprintf(p, ",%d", sbs->altitude);
+        }
+    } else {
+        p += sprintf(p, ",");
+    }
+
+    // Field 13: ground speed
+    if (sbs->ground_speed_valid) {
+        p += sprintf(p, ",%.0f", sbs->ground_speed);
+    } else {
+        p += sprintf(p, ",");
+    }
+
+    // Field 14: track
+    if (sbs->track_valid) {
+        p += sprintf(p, ",%.0f", sbs->track);
+    } else {
+        p += sprintf(p, ",");
+    }
+
+    // Fields 15 and 16: lat/lon
+    if (sbs->position_valid) {
+        p += sprintf(p, ",%1.5f,%1.5f", sbs->latitude, sbs->longitude);
+    } else {
+        p += sprintf(p, ",,");
+    }
+
+    // Field 17: vertical rate
+    if (sbs->vertical_rate_valid) {
+        if (sbs->vertical_rate_is_gnss) {
+            p += sprintf(p, ",%dH", sbs->vertical_rate);
+        } else {
+            p += sprintf(p, ",%d", sbs->vertical_rate);
+        }
+    } else {
+        p += sprintf(p, ",");
+    }
+
+    // Field 18: squawk
+    if (sbs->squawk_valid) {
+        p += sprintf(p, ",%04x", sbs->squawk);
+    } else {
+        p += sprintf(p, ",");
+    }
+
+    // Field 19: alert
+    if (sbs->alert_valid) {
+        p += sprintf(p, ",%d", sbs->alert);
+    } else {
+        p += sprintf(p, ",");
+    }
+
+    // Field 20: emergency
+    if (sbs->emergency_valid) {
+        p += sprintf(p, ",%d", sbs->emergency);
+    } else {
+        p += sprintf(p, ",");
+    }
+
+    // Field 21: SPI
+    if (sbs->spi_valid) {
+        p += sprintf(p, ",%d", sbs->spi);
+    } else {
+        p += sprintf(p, ",");
+    }
+
+    // Field 22: on ground
+    if (sbs->airground_valid) {
+        p += sprintf(p, ",%d", sbs->is_on_ground);
+    } else {
+        p += sprintf(p, ",");
+    }
+
+    // End of message
+    p += sprintf(p, "\r\n");
+
+    return p;
+}
+
+//=========================================================================
+//
 // Write raw output to TCP clients
 //
 static void modesSendRawOutput(struct modesMessage *mm, struct aircraft *a) {
@@ -570,9 +958,7 @@ static void send_raw_heartbeat(struct net_service *service)
 //
 static void modesSendSBSOutput(struct modesMessage *mm, struct aircraft *a) {
     char *p;
-    struct timespec now;
-    struct tm    stTime_receive, stTime_now;
-    int          msgType;
+    struct sbs_message sbs;
 
     // We require a tracked aircraft for SBS output
     if (!a)
@@ -594,213 +980,85 @@ static void modesSendSBSOutput(struct modesMessage *mm, struct aircraft *a) {
     if (mm->addr & MODES_NON_ICAO_ADDRESS)
         return;
 
-    p = prepareWrite(&Modes.sbs_out, 200);
+    // Populate the SBS message structure
+    populateSBSMessage(&sbs, mm, a);
+
+    // Check if we got a valid transmission type
+    if (sbs.transmission_type == 0)
+        return;
+
+    // Prepare output buffer (use struct size as buffer size)
+    p = prepareWrite(&Modes.sbs_out, sizeof(struct sbs_message));
     if (!p)
         return;
 
-    //
-    // SBS BS style output checked against the following reference
-    // http://www.homepages.mcb.net/bones/SBS/Article/Barebones42_Socket_Data.htm - seems comprehensive
-    //
-
-    // Decide on the basic SBS Message Type
-    switch (mm->msgtype) {
-    case 4:
-    case 20:
-        msgType = 5;
-        break;
-        break;
-
-    case 5:
-    case 21:
-        msgType = 6;
-        break;
-
-    case 0:
-    case 16:
-        msgType = 7;
-        break;
-
-    case 11:
-        msgType = 8;
-        break;
-
-    case 17:
-    case 18:
-        if (mm->metype >= 1 && mm->metype <= 4) {
-            msgType = 1;
-        } else if (mm->metype >= 5 && mm->metype <=  8) {
-            msgType = 2;
-        } else if (mm->metype >= 9 && mm->metype <= 18) {
-            msgType = 3;
-        } else if (mm->metype == 19) {
-            msgType = 4;
-        } else {
-            return;
-        }
-        break;
-
-    default:
-        return;
-    }
-
-    // Fields 1 to 6 : SBS message type and ICAO address of the aircraft and some other stuff
-    p += sprintf(p, "MSG,%d,1,1,%06X,1,", msgType, mm->addr);
-
-    // Find current system time
-    clock_gettime(CLOCK_REALTIME, &now);
-    localtime_r(&now.tv_sec, &stTime_now);
-
-    // Find message reception time
-    time_t received = (time_t) (mm->sysTimestampMsg / 1000);
-    localtime_r(&received, &stTime_receive);
-
-    // Fields 7 & 8 are the message reception time and date
-    p += sprintf(p, "%04d/%02d/%02d,", (stTime_receive.tm_year+1900),(stTime_receive.tm_mon+1), stTime_receive.tm_mday);
-    p += sprintf(p, "%02d:%02d:%02d.%03u,", stTime_receive.tm_hour, stTime_receive.tm_min, stTime_receive.tm_sec, (unsigned) (mm->sysTimestampMsg % 1000));
-
-    // Fields 9 & 10 are the current time and date
-    p += sprintf(p, "%04d/%02d/%02d,", (stTime_now.tm_year+1900),(stTime_now.tm_mon+1), stTime_now.tm_mday);
-    p += sprintf(p, "%02d:%02d:%02d.%03u", stTime_now.tm_hour, stTime_now.tm_min, stTime_now.tm_sec, (unsigned) (now.tv_nsec / 1000000U));
-
-    // Field 11 is the callsign (if we have it)
-    if (mm->callsign_valid) {p += sprintf(p, ",%s", mm->callsign);}
-    else                    {p += sprintf(p, ",");}
-
-    // Field 12 is the altitude (if we have it)
-    if (Modes.use_gnss) {
-        if (mm->altitude_geom_valid) {
-            p += sprintf(p, ",%dH", mm->altitude_geom);
-        } else if (mm->altitude_baro_valid && trackDataValid(&a->geom_delta_valid)) {
-            p += sprintf(p, ",%dH", mm->altitude_baro + a->geom_delta);
-        } else if (mm->altitude_baro_valid) {
-            p += sprintf(p, ",%d", mm->altitude_baro);
-        } else {
-            p += sprintf(p, ",");
-        }
-    } else {
-        if (mm->altitude_baro_valid) {
-            p += sprintf(p, ",%d", mm->altitude_baro);
-        } else if (mm->altitude_geom_valid && trackDataValid(&a->geom_delta_valid)) {
-            p += sprintf(p, ",%d", mm->altitude_geom - a->geom_delta);
-        } else {
-            p += sprintf(p, ",");
-        }
-    }
-
-    // Field 13 is the ground Speed (if we have it)
-    if (mm->gs_valid) {
-        p += sprintf(p, ",%.0f", mm->gs.selected);
-    } else {
-        p += sprintf(p, ",");
-    }
-
-    // Field 14 is the ground Heading (if we have it)
-    if (mm->heading_valid && mm->heading_type == HEADING_GROUND_TRACK) {
-        p += sprintf(p, ",%.0f", mm->heading);
-    } else {
-        p += sprintf(p, ",");
-    }
-
-    // Fields 15 and 16 are the Lat/Lon (if we have it)
-    if (mm->cpr_decoded) {
-        p += sprintf(p, ",%1.5f,%1.5f", mm->decoded_lat, mm->decoded_lon);
-    } else {
-        p += sprintf(p, ",,");
-    }
-
-    // Field 17 is the VerticalRate (if we have it)
-    if (Modes.use_gnss) {
-        if (mm->geom_rate_valid) {
-            p += sprintf(p, ",%dH", mm->geom_rate);
-        } else if (mm->baro_rate_valid) {
-            p += sprintf(p, ",%d", mm->baro_rate);
-        } else {
-            p += sprintf(p, ",");
-        }
-    } else {
-        if (mm->baro_rate_valid) {
-            p += sprintf(p, ",%d", mm->baro_rate);
-        } else if (mm->geom_rate_valid) {
-            p += sprintf(p, ",%d", mm->geom_rate);
-        } else {
-            p += sprintf(p, ",");
-        }
-    }
-
-    // Field 18 is  the Squawk (if we have it)
-    if (mm->squawk_valid) {
-        p += sprintf(p, ",%04x", mm->squawk);
-    } else {
-        p += sprintf(p, ",");
-    }
-
-    // Field 19 is the Squawk Changing Alert flag (if we have it)
-    if (mm->alert_valid) {
-        if (mm->alert) {
-            p += sprintf(p, ",-1");
-        } else {
-            p += sprintf(p, ",0");
-        }
-    } else {
-        p += sprintf(p, ",");
-    }
-
-    // Field 20 is the Squawk Emergency flag (if we have it)
-    if (mm->squawk_valid) {
-        if ((mm->squawk == 0x7500) || (mm->squawk == 0x7600) || (mm->squawk == 0x7700)) {
-            p += sprintf(p, ",-1");
-        } else {
-            p += sprintf(p, ",0");
-        }
-    } else {
-        p += sprintf(p, ",");
-    }
-
-    // Field 21 is the Squawk Ident flag (if we have it)
-    if (mm->spi_valid) {
-        if (mm->spi) {
-            p += sprintf(p, ",-1");
-        } else {
-            p += sprintf(p, ",0");
-        }
-    } else {
-        p += sprintf(p, ",");
-    }
-
-    // Field 22 is the OnTheGround flag (if we have it)
-    switch (mm->airground) {
-    case AG_GROUND:
-        p += sprintf(p, ",-1");
-        break;
-    case AG_AIRBORNE:
-        p += sprintf(p, ",0");
-        break;
-    default:
-        p += sprintf(p, ",");
-        break;
-    }
-
-    p += sprintf(p, "\r\n");
+    // Format the SBS message into the output buffer
+    p = formatSBSMessage(p, &sbs);
 
     completeWrite(&Modes.sbs_out, p);
 }
 
 static void send_sbs_heartbeat(struct net_service *service)
 {
-    static char *heartbeat_message = "\r\n";  // is there a better one?
-    char *data;
-    int len = strlen(heartbeat_message);
+    char *p;
+    struct sbs_message sbs;
+    struct timespec now;
+    struct tm stTime_now;
 
     if (!service->writer)
         return;
 
-    data = prepareWrite(service->writer, len);
-    if (!data)
+    // Initialize the SBS message structure with empty/default values
+    memset(&sbs, 0, sizeof(sbs));
+
+    // Set basic metadata for heartbeat message using CLK type
+    sbs.message_type = SBS_CLK;
+    sbs.transmission_type = 0;  // CLK messages don't use transmission type
+    sbs.session_id = 1;
+    sbs.aircraft_id = 1;
+    sbs.hex_ident = 0x000000;   // Use all zeros for heartbeat
+    sbs.flight_id = 1;
+    sbs.position_valid = false;
+    sbs.altitude_valid = false;
+
+    // Get current time for both generated and logged timestamps
+    clock_gettime(CLOCK_REALTIME, &now);
+    localtime_r(&now.tv_sec, &stTime_now);
+
+    // Format date and time fields (same for both generated and logged)
+    sprintf(sbs.date_generated, "%04d/%02d/%02d",
+            stTime_now.tm_year + 1900,
+            stTime_now.tm_mon + 1,
+            stTime_now.tm_mday);
+    sprintf(sbs.time_generated, "%02d:%02d:%02d.%03u",
+            stTime_now.tm_hour,
+            stTime_now.tm_min,
+            stTime_now.tm_sec,
+            (unsigned)(now.tv_nsec / 1000000U));
+    sprintf(sbs.date_logged, "%04d/%02d/%02d",
+            stTime_now.tm_year + 1900,
+            stTime_now.tm_mon + 1,
+            stTime_now.tm_mday);
+    sprintf(sbs.time_logged, "%02d:%02d:%02d.%03u",
+            stTime_now.tm_hour,
+            stTime_now.tm_min,
+            stTime_now.tm_sec,
+            (unsigned)(now.tv_nsec / 1000000U));
+
+    // Leave callsign empty
+    sbs.callsign[0] = '\0';
+
+    // All validity flags are already false from memset
+
+    // Prepare output buffer
+    p = prepareWrite(service->writer, sizeof(struct sbs_message));
+    if (!p)
         return;
 
-    memcpy(data, heartbeat_message, len);
-    completeWrite(service->writer, data + len);
+    // Format the SBS message into the output buffer
+    p = formatSBSMessage(p, &sbs);
+
+    completeWrite(service->writer, p);
 }
 
 //
