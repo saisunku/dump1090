@@ -104,6 +104,43 @@ typedef enum {
     SBS_CLK
 } sbs_message_type_t;
 
+//
+// Helper function to safely format date and time with validation
+//
+static void formatSBSDateTime(const struct tm *tm, uint64_t timestamp_ms,
+                               char *date_buf, size_t date_size,
+                               char *time_buf, size_t time_size,
+                               const char *context) {
+    int year = tm->tm_year + 1900;
+    int mon = tm->tm_mon + 1;
+    int mday = tm->tm_mday;
+
+    // Validate and warn if out of expected range
+    if (year < 1900 || year > 9999 || mon < 1 || mon > 12 || mday < 1 || mday > 31) {
+        fprintf(stderr, "SBS %s: Warning - date out of range: %d/%d/%d\n", context, year, mon, mday);
+    }
+    if (tm->tm_hour < 0 || tm->tm_hour > 23 ||
+        tm->tm_min < 0 || tm->tm_min > 59 ||
+        tm->tm_sec < 0 || tm->tm_sec > 59) {
+        fprintf(stderr, "SBS %s: Warning - time out of range: %d:%d:%d\n",
+                context, tm->tm_hour, tm->tm_min, tm->tm_sec);
+    }
+
+    // Format with temporary buffers and truncate to fit
+    char temp_date[32];
+    char temp_time[32];
+
+    snprintf(temp_date, sizeof(temp_date), "%04d/%02d/%02d", year, mon, mday);
+    strncpy(date_buf, temp_date, date_size - 1);
+    date_buf[date_size - 1] = '\0';
+
+    snprintf(temp_time, sizeof(temp_time), "%02d:%02d:%02d.%03u",
+             tm->tm_hour, tm->tm_min, tm->tm_sec,
+             (unsigned)(timestamp_ms % 1000));
+    strncpy(time_buf, temp_time, time_size - 1);
+    time_buf[time_size - 1] = '\0';
+}
+
 struct sbs_message {
     // Fields 1-10: Message metadata
     sbs_message_type_t message_type;  // Field 1: Message type
@@ -627,25 +664,15 @@ static void populateSBSMessage(struct sbs_message *sbs, struct modesMessage *mm,
     time_t received = (time_t)(mm->sysTimestampMsg / 1000);
     localtime_r(&received, &stTime_receive);
 
-    // Format date and time fields
-    sprintf(sbs->date_generated, "%04d/%02d/%02d",
-            stTime_receive.tm_year + 1900,
-            stTime_receive.tm_mon + 1,
-            stTime_receive.tm_mday);
-    sprintf(sbs->time_generated, "%02d:%02d:%02d.%03u",
-            stTime_receive.tm_hour,
-            stTime_receive.tm_min,
-            stTime_receive.tm_sec,
-            (unsigned)(mm->sysTimestampMsg % 1000));
-    sprintf(sbs->date_logged, "%04d/%02d/%02d",
-            stTime_now.tm_year + 1900,
-            stTime_now.tm_mon + 1,
-            stTime_now.tm_mday);
-    sprintf(sbs->time_logged, "%02d:%02d:%02d.%03u",
-            stTime_now.tm_hour,
-            stTime_now.tm_min,
-            stTime_now.tm_sec,
-            (unsigned)(now.tv_nsec / 1000000U));
+    // Format date and time fields using helper function
+    formatSBSDateTime(&stTime_receive, mm->sysTimestampMsg,
+                      sbs->date_generated, sizeof(sbs->date_generated),
+                      sbs->time_generated, sizeof(sbs->time_generated),
+                      "received");
+    formatSBSDateTime(&stTime_now, now.tv_nsec / 1000000U,
+                      sbs->date_logged, sizeof(sbs->date_logged),
+                      sbs->time_logged, sizeof(sbs->time_logged),
+                      "logged");
 
     // Populate callsign
     if (mm->callsign_valid) {
@@ -1025,25 +1052,16 @@ static void send_sbs_heartbeat(struct net_service *service)
     clock_gettime(CLOCK_REALTIME, &now);
     localtime_r(&now.tv_sec, &stTime_now);
 
-    // Format date and time fields (same for both generated and logged)
-    sprintf(sbs.date_generated, "%04d/%02d/%02d",
-            stTime_now.tm_year + 1900,
-            stTime_now.tm_mon + 1,
-            stTime_now.tm_mday);
-    sprintf(sbs.time_generated, "%02d:%02d:%02d.%03u",
-            stTime_now.tm_hour,
-            stTime_now.tm_min,
-            stTime_now.tm_sec,
-            (unsigned)(now.tv_nsec / 1000000U));
-    sprintf(sbs.date_logged, "%04d/%02d/%02d",
-            stTime_now.tm_year + 1900,
-            stTime_now.tm_mon + 1,
-            stTime_now.tm_mday);
-    sprintf(sbs.time_logged, "%02d:%02d:%02d.%03u",
-            stTime_now.tm_hour,
-            stTime_now.tm_min,
-            stTime_now.tm_sec,
-            (unsigned)(now.tv_nsec / 1000000U));
+    // Format date and time fields using helper function (same for both generated and logged)
+    uint64_t timestamp_ms = now.tv_nsec / 1000000U;
+    formatSBSDateTime(&stTime_now, timestamp_ms,
+                      sbs.date_generated, sizeof(sbs.date_generated),
+                      sbs.time_generated, sizeof(sbs.time_generated),
+                      "heartbeat");
+    formatSBSDateTime(&stTime_now, timestamp_ms,
+                      sbs.date_logged, sizeof(sbs.date_logged),
+                      sbs.time_logged, sizeof(sbs.time_logged),
+                      "heartbeat");
 
     // Leave callsign empty
     sbs.callsign[0] = '\0';
